@@ -1,0 +1,16 @@
+[target.x86_64-pc-windows-gnu]
+linker = "clang"
+rustflags = [
+	"--cfg", "windows_sys",
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+rustflags = ["-C", "link-arg=/DEBUG:NONE"]
+
+[env]
+FFMPEG_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0"
+FFMPEG_LIBS_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0/lib"
+FFMPEG_INCLUDE_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0/include"
+FFMPEG_SKIP_BUILD = "1"

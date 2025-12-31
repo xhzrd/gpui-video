@@ -1,5 +1,5 @@
 use gpui::{App, Application, Context, Render, Window, WindowOptions, div, prelude::*};
-use gpui_video_player::{Video, video};
+use gpui_video::{Video, video};
 use std::path::PathBuf;
 use url::Url;
 

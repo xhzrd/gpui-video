@@ -1,14 +1,18 @@
 //! A video player library for [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui)
-//! applications, built on top of GStreamer.
+//! applications, built on top of FFmpeg.
 //!
-//! This library provides efficient video playback with hardware-accelerated rendering
-//! on supported platforms (macOS uses CVPixelBuffer when available).
+//! This library provides efficient video playback with hardware-accelerated decoding
+//! on supported platforms (macOS uses CVPixelBuffer when available for rendering).
 //!
 //! # Prerequisites
 //!
-//! GStreamer 1.14+ and its plugins must be installed on your system.
-//! See the [GStreamer Rust bindings installation guide](https://github.com/sdroege/gstreamer-rs?tab=readme-ov-file#installation)
-//! for platform-specific instructions.
+//! FFmpeg 4.0+ libraries must be installed on your system:
+//! - **macOS**: `brew install ffmpeg`
+//! - **Ubuntu/Debian**: `apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev`
+//! - **Arch Linux**: `pacman -S ffmpeg`
+//! - **Windows**: Download FFmpeg shared libraries from [ffmpeg.org](https://ffmpeg.org/download.html)
+//!
+//! The library uses dynamic linking for LGPL compliance.
 //!
 //! # Example
 //!
@@ -68,6 +72,14 @@
 //! video.set_speed(1.5).ok();           // Play at 1.5x speed
 //! ```
 //!
+//! # Performance Features
+//!
+//! - **Hardware acceleration**: Automatically uses available hardware decoders
+//! - **Multi-threaded decoding**: FFmpeg frame threading enabled by default
+//! - **Optimized frame buffering**: Configurable buffer to balance memory and smoothness
+//! - **Non-blocking playback**: Separate decoder thread prevents UI blocking
+//! - **Efficient pixel format**: Direct NV12 output reduces conversion overhead
+//!
 //! See the `examples/` directory for more complete usage patterns.
 
 mod element;
@@ -79,5 +91,4 @@ pub use error::Error;
 pub use video::{Position, Video, VideoOptions};
 
 // Re-export commonly used types
-pub use gstreamer as gst;
 pub use url::Url;

@@ -1,4 +1,4 @@
-# `gpui-video-player`
+# `gpui-video`
 
 A video player library for [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) applications, built on top of GStreamer. This library provides efficient video playback with hardware-accelerated rendering on supported platforms.
 
@@ -22,7 +22,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-gpui-video-player = "0.1.0"
+gpui-video = "0.1.0"
 ```
 
 **Note:** This library depends on GPUI, which must be available in your project. The current version requires GPUI from the Zed repository.
@@ -33,7 +33,7 @@ gpui-video-player = "0.1.0"
 
 ```rust
 use gpui::{App, Application, Context, Render, Window, WindowOptions, div, prelude::*};
-use gpui_video_player::{Video, video};
+use gpui_video::{Video, video};
 use std::path::PathBuf;
 use url::Url;
 
@@ -81,7 +81,7 @@ fn main() {
 ### Video Controls
 
 ```rust
-use gpui_video_player::Video;
+use gpui_video::Video;
 use std::time::Duration;
 
 // Playback control
@@ -106,7 +106,7 @@ video.set_display_height(Some(600)); // Override height
 ### Advanced Configuration
 
 ```rust
-use gpui_video_player::{Video, VideoOptions, video};
+use gpui_video::{Video, VideoOptions, video};
 
 let options = VideoOptions {
     frame_buffer_capacity: Some(10), // Buffer 10 frames
@@ -120,7 +120,7 @@ let video = Video::new_with_options(&uri, options)?;
 ### Looping Playback Example
 
 ```rust
-use gpui_video_player::{Video, VideoOptions};
+use gpui_video::{Video, VideoOptions};
 
 let looped_video = Video::new_with_options(
     &uri,
@@ -138,7 +138,7 @@ Call `set_looping(true)` at runtime whenever you want to ensure the current stre
 ### Custom Video Element
 
 ```rust
-use gpui_video_player::{VideoElement, video};
+use gpui_video::{VideoElement, video};
 
 let video_element = video(my_video)
     .id("custom-video")
@@ -172,7 +172,7 @@ GPUI element for rendering video with:
 Time or frame-based positioning:
 
 ```rust
-use gpui_video_player::Position;
+use gpui_video::Position;
 use std::time::Duration;
 
 let time_pos = Position::Time(Duration::from_secs(10));

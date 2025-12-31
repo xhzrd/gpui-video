@@ -1,11 +1,14 @@
-fn main() {
-    if cfg!(target_os = "macos") {
-        // Add the GStreamer framework directory to the library search path
-        println!("cargo:rustc-link-search=framework=/Library/Frameworks");
+// No build configuration needed for dynamic FFmpeg linking
+// The ffmpeg-next crate handles FFmpeg library discovery automatically
+// Users must have FFmpeg libraries installed on their system
 
-        // Add an rpath to the GStreamer framework directory
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,/Library/Frameworks/GStreamer.framework/Versions/1.0/lib"
-        );
-    }
+fn main() {
+    // Print cargo metadata for documentation purposes
+    println!("cargo:rerun-if-changed=build.rs");
+
+    // Note: FFmpeg libraries are dynamically linked
+    // Ensure FFmpeg 4.0+ is installed on your system:
+    // - macOS: brew install ffmpeg
+    // - Ubuntu/Debian: apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    // - Windows: Download FFmpeg shared libraries from ffmpeg.org
 }

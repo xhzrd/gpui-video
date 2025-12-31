@@ -2,7 +2,7 @@ use gpui::{
     App, Application, Context, CursorStyle, Render, Window, WindowOptions, div, prelude::*,
 };
 use gpui_component::button::Button;
-use gpui_video_player::{Video, video};
+use gpui_video::{Video, video};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -104,7 +104,7 @@ impl Render for WithControlsExample {
                     .child(
                         video(self.video.clone())
                             .id("controlled-video")
-                            .buffer_capacity(3),
+                            .buffer_capacity(60),
                     )
                     .child(
                         div()
@@ -131,7 +131,7 @@ fn main() {
     env_logger::init();
     Application::new().run(|cx: &mut App| {
         let uri = Url::from_file_path(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("./assets/test3.mp4"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("./assets/bigbuckbunny.mp4"),
         )
         .expect("invalid file path");
 
