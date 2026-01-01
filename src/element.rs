@@ -270,7 +270,6 @@ impl VideoElement {
         let mut bgra = vec![0u8; width_usize * height_usize * 4];
         let rgba_stride = width * 4;
 
-        // Try different color space conversions
         if yuv_nv12_to_bgra(
             &yuv_bi_planar,
             &mut bgra,
@@ -367,11 +366,9 @@ impl Element for VideoElement {
         window: &mut Window,
         _cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        // Always request animation frame when playing or when new frames arrive
-        let is_playing = !self.video.eos() && !self.video.paused();
-        if is_playing || self.video.buffered_len() > 0 {
-            window.request_animation_frame();
-        }
+        // ALWAYS request animation frames to keep video flowing
+        // This is critical for smooth playback
+        window.request_animation_frame();
     }
 
     fn paint(
@@ -384,7 +381,7 @@ impl Element for VideoElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        // Just render the current frame - the decoder handles frame timing
+        // Get and render the current frame
         let frame_data = self.video.current_frame_data();
 
         if let Some((yuv_data, frame_width, frame_height)) = frame_data {

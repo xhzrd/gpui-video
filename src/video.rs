@@ -62,8 +62,7 @@ enum DecodeResult {
     Eos,
 }
 
-// Improved ring buffer with better wraparound handling
-struct AudioRingBuffer {
+pub(crate) struct AudioRingBuffer {
     buffer: Vec<f32>,
     capacity: usize,
     read_pos: usize,
@@ -153,18 +152,16 @@ pub struct VideoOptions {
 impl Default for VideoOptions {
     fn default() -> Self {
         Self {
-            frame_buffer_capacity: Some(60), // Increased default buffer
+            frame_buffer_capacity: Some(120),
             looping: Some(false),
             speed: Some(1.0),
-            prebuffer_frames: Some(10), // Increased prebuffer
+            prebuffer_frames: Some(5), // Smaller prebuffer for faster start
         }
     }
 }
 
-enum DecoderCommand {
-    Seek(i64, bool),
-    SetPaused(bool),
-    SetSpeed(f64),
+pub(crate) enum DecoderCommand {
+    Seek(i64),
     Stop,
 }
 
@@ -179,22 +176,21 @@ pub(crate) struct Internal {
     pub(crate) sample_rate: u32,
 
     pub(crate) frame: Arc<Mutex<Frame>>,
-    pub(crate) upload_frame: Arc<AtomicBool>,
     pub(crate) frame_buffer: Arc<Mutex<VecDeque<Frame>>>,
     pub(crate) frame_buffer_capacity: Arc<AtomicUsize>,
 
     pub(crate) audio_ring: Arc<Mutex<AudioRingBuffer>>,
-    pub(crate) audio_clock: Arc<Mutex<Duration>>,
+    pub(crate) audio_pts: Arc<Mutex<Duration>>,
     pub(crate) samples_played: Arc<AtomicU64>,
-    pub(crate) last_audio_pts: Arc<Mutex<Duration>>, // NEW: Track actual audio PTS
 
     pub(crate) speed: Arc<AtomicU64>,
     pub(crate) looping: Arc<AtomicBool>,
     pub(crate) is_paused: Arc<AtomicBool>,
     pub(crate) is_eos: Arc<AtomicBool>,
-    pub(crate) current_pts: Arc<AtomicU64>,
-    pub(crate) playback_start: Arc<Mutex<Option<Instant>>>, // Simplified timing
-    pub(crate) seek_target: Arc<Mutex<Option<Duration>>>,   // NEW: Track seek target
+
+    // Clock management
+    pub(crate) video_clock: Arc<Mutex<Duration>>,
+    pub(crate) last_clock_update: Arc<Mutex<Instant>>,
 
     pub(crate) command_tx: Sender<DecoderCommand>,
     pub(crate) alive: Arc<AtomicBool>,
@@ -221,7 +217,7 @@ impl std::fmt::Debug for Internal {
 }
 
 impl Internal {
-    pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
+    pub(crate) fn seek(&self, position: impl Into<Position>, _accurate: bool) -> Result<(), Error> {
         let position = position.into();
 
         let target_seconds = match position {
@@ -232,38 +228,40 @@ impl Internal {
             }
         };
 
+        let target_seconds = target_seconds.max(0.0).min(self.duration.as_secs_f64());
+
         let timestamp = (target_seconds * self.time_base.denominator() as f64
             / self.time_base.numerator() as f64) as i64;
 
-        let target_duration = Duration::from_secs_f64(target_seconds);
+        log::info!("Seeking to {:.2}s (pts: {})", target_seconds, timestamp);
 
-        // Clear state FIRST
+        // Clear state
         self.is_eos.store(false, Ordering::Release);
         self.frame_buffer.lock().clear();
         self.audio_ring.lock().clear();
+        self.samples_played.store(0, Ordering::SeqCst);
 
-        // Set seek target - decoder will handle the rest
-        *self.seek_target.lock() = Some(target_duration);
-        *self.playback_start.lock() = None;
+        // Reset clocks
+        let target_duration = Duration::from_secs_f64(target_seconds);
+        *self.video_clock.lock() = target_duration;
+        *self.audio_pts.lock() = target_duration;
+        *self.last_clock_update.lock() = Instant::now();
 
         self.command_tx
-            .send(DecoderCommand::Seek(timestamp, accurate))
+            .send(DecoderCommand::Seek(timestamp))
             .map_err(|_| Error::Sync)?;
 
         Ok(())
     }
 
     pub(crate) fn set_speed(&mut self, speed: f64) -> Result<(), Error> {
-        if speed <= 0.0 {
+        if speed <= 0.0 || speed > 16.0 {
             return Err(Error::Framerate(speed));
         }
 
+        log::info!("Setting speed to {:.2}x", speed);
         self.speed.store(speed.to_bits(), Ordering::SeqCst);
-        *self.playback_start.lock() = None; // Reset timing
-
-        self.command_tx
-            .send(DecoderCommand::SetSpeed(speed))
-            .map_err(|_| Error::Sync)?;
+        *self.last_clock_update.lock() = Instant::now();
 
         Ok(())
     }
@@ -272,18 +270,32 @@ impl Internal {
         let was_paused = self.is_paused.swap(paused, Ordering::SeqCst);
 
         if was_paused && !paused {
-            *self.playback_start.lock() = None; // Reset timing on resume
+            *self.last_clock_update.lock() = Instant::now();
+            log::info!("Resuming playback");
+        } else if !was_paused && paused {
+            log::info!("Pausing playback");
         }
 
-        let _ = self.command_tx.send(DecoderCommand::SetPaused(paused));
-
         if self.is_eos.load(Ordering::Acquire) && !paused {
+            log::info!("Restarting from EOS");
             let _ = self.seek(0, false);
         }
     }
 
     pub(crate) fn paused(&self) -> bool {
         self.is_paused.load(Ordering::Acquire)
+    }
+
+    fn get_master_clock(&self) -> Duration {
+        if self.has_audio {
+            let played = self.samples_played.load(Ordering::SeqCst);
+            Duration::from_secs_f64(played as f64 / (self.sample_rate as f64 * 2.0))
+        } else {
+            let speed = f64::from_bits(self.speed.load(Ordering::SeqCst));
+            let elapsed = self.last_clock_update.lock().elapsed();
+            let clock = *self.video_clock.lock();
+            clock + Duration::from_secs_f64(elapsed.as_secs_f64() * speed)
+        }
     }
 }
 
@@ -383,37 +395,40 @@ impl Video {
         let has_audio = audio_stream.is_some();
         let audio_stream_index = audio_stream.map(|s| s.index());
 
+        log::info!(
+            "Video: {}x{} @ {:.2}fps, {:.2}s, audio: {}",
+            width, height, framerate, duration.as_secs_f64(), has_audio
+        );
+
         let frame = Arc::new(Mutex::new(Frame::empty()));
-        let upload_frame = Arc::new(AtomicBool::new(false));
         let frame_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(
-            options.frame_buffer_capacity.unwrap_or(60),
+            options.frame_buffer_capacity.unwrap_or(120),
         )));
         let frame_buffer_capacity = Arc::new(AtomicUsize::new(
-            options.frame_buffer_capacity.unwrap_or(60),
+            options.frame_buffer_capacity.unwrap_or(120),
         ));
 
-        // Reduced audio buffer - 1 second is plenty
         let audio_ring = Arc::new(Mutex::new(AudioRingBuffer::new(48000 * 2 * 2)));
-        let audio_clock = Arc::new(Mutex::new(Duration::ZERO));
+        let audio_pts = Arc::new(Mutex::new(Duration::ZERO));
         let samples_played = Arc::new(AtomicU64::new(0));
-        let last_audio_pts = Arc::new(Mutex::new(Duration::ZERO));
 
         let speed = Arc::new(AtomicU64::new(options.speed.unwrap_or(1.0).to_bits()));
         let looping = Arc::new(AtomicBool::new(options.looping.unwrap_or(false)));
         let is_paused = Arc::new(AtomicBool::new(false));
         let is_eos = Arc::new(AtomicBool::new(false));
-        let current_pts = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let volume = Arc::new(Mutex::new(1.0));
         let muted = Arc::new(AtomicBool::new(false));
-        let playback_start = Arc::new(Mutex::new(None::<Instant>));
-        let seek_target = Arc::new(Mutex::new(None::<Duration>));
+
+        let video_clock = Arc::new(Mutex::new(Duration::ZERO));
+        let last_clock_update = Arc::new(Mutex::new(Instant::now()));
 
         let (command_tx, command_rx) = bounded(100);
-        let prebuffer_frames = options.prebuffer_frames.unwrap_or(10);
+        let prebuffer_frames = options.prebuffer_frames.unwrap_or(5);
 
         let (audio_stream, actual_sample_rate) = if has_audio {
             let audio_ring_for_output = Arc::clone(&audio_ring);
+            let audio_pts_for_output = Arc::clone(&audio_pts);
             let volume_for_output = Arc::clone(&volume);
             let muted_for_output = Arc::clone(&muted);
             let is_paused_for_output = Arc::clone(&is_paused);
@@ -421,6 +436,7 @@ impl Video {
 
             match Self::setup_audio_output(
                 audio_ring_for_output,
+                audio_pts_for_output,
                 volume_for_output,
                 muted_for_output,
                 is_paused_for_output,
@@ -428,7 +444,7 @@ impl Video {
             ) {
                 Ok((stream, sr)) => (Some(stream), sr),
                 Err(e) => {
-                    log::warn!("Failed to setup audio: {:?}", e);
+                    log::warn!("Audio setup failed: {:?}", e);
                     (None, 48000)
                 }
             }
@@ -436,23 +452,20 @@ impl Video {
             (None, 48000)
         };
 
-        // Clone all Arc references for decoder thread
+        // Clone for decoder thread
         let frame_ref = Arc::clone(&frame);
-        let upload_frame_ref = Arc::clone(&upload_frame);
         let frame_buffer_ref = Arc::clone(&frame_buffer);
         let frame_buffer_capacity_ref = Arc::clone(&frame_buffer_capacity);
         let audio_ring_ref = Arc::clone(&audio_ring);
-        let audio_clock_ref = Arc::clone(&audio_clock);
+        let audio_pts_ref = Arc::clone(&audio_pts);
         let samples_played_ref = Arc::clone(&samples_played);
-        let last_audio_pts_ref = Arc::clone(&last_audio_pts);
         let speed_ref = Arc::clone(&speed);
         let looping_ref = Arc::clone(&looping);
         let is_paused_ref = Arc::clone(&is_paused);
         let is_eos_ref = Arc::clone(&is_eos);
-        let current_pts_ref = Arc::clone(&current_pts);
         let alive_ref = Arc::clone(&alive);
-        let playback_start_ref = Arc::clone(&playback_start);
-        let seek_target_ref = Arc::clone(&seek_target);
+        let video_clock_ref = Arc::clone(&video_clock);
+        let last_clock_update_ref = Arc::clone(&last_clock_update);
 
         let decoder_thread = std::thread::spawn(move || {
             if let Err(e) = Self::decoder_loop(
@@ -460,28 +473,26 @@ impl Video {
                 video_stream_index,
                 audio_stream_index,
                 frame_ref,
-                upload_frame_ref,
                 frame_buffer_ref,
                 frame_buffer_capacity_ref,
                 audio_ring_ref,
-                audio_clock_ref,
+                audio_pts_ref,
                 samples_played_ref,
-                last_audio_pts_ref,
                 speed_ref,
                 looping_ref,
                 is_paused_ref,
                 is_eos_ref,
-                current_pts_ref,
                 alive_ref,
-                playback_start_ref,
-                seek_target_ref,
+                video_clock_ref,
+                last_clock_update_ref,
                 command_rx,
                 time_base,
                 framerate,
                 actual_sample_rate,
                 prebuffer_frames,
+                has_audio,
             ) {
-                log::error!("Decoder thread error: {:?}", e);
+                log::error!("Decoder error: {:?}", e);
             }
         });
 
@@ -496,22 +507,19 @@ impl Video {
             sample_rate: actual_sample_rate,
 
             frame,
-            upload_frame,
             frame_buffer,
             frame_buffer_capacity,
 
             audio_ring,
-            audio_clock,
+            audio_pts,
             samples_played,
-            last_audio_pts,
 
             speed,
             looping,
             is_paused,
             is_eos,
-            current_pts,
-            playback_start,
-            seek_target,
+            video_clock,
+            last_clock_update,
 
             command_tx,
             alive,
@@ -532,26 +540,24 @@ impl Video {
         video_stream_index: usize,
         audio_stream_index: Option<usize>,
         frame: Arc<Mutex<Frame>>,
-        upload_frame: Arc<AtomicBool>,
         frame_buffer: Arc<Mutex<VecDeque<Frame>>>,
         frame_buffer_capacity: Arc<AtomicUsize>,
         audio_ring: Arc<Mutex<AudioRingBuffer>>,
-        audio_clock: Arc<Mutex<Duration>>,
+        audio_pts: Arc<Mutex<Duration>>,
         samples_played: Arc<AtomicU64>,
-        last_audio_pts: Arc<Mutex<Duration>>,
         speed: Arc<AtomicU64>,
         looping: Arc<AtomicBool>,
         is_paused: Arc<AtomicBool>,
         is_eos: Arc<AtomicBool>,
-        current_pts: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
-        playback_start: Arc<Mutex<Option<Instant>>>,
-        seek_target: Arc<Mutex<Option<Duration>>>,
+        video_clock: Arc<Mutex<Duration>>,
+        last_clock_update: Arc<Mutex<Instant>>,
         command_rx: Receiver<DecoderCommand>,
         time_base: ffmpeg::Rational,
         framerate: f64,
         output_sample_rate: u32,
         prebuffer_frames: usize,
+        has_audio: bool,
     ) -> Result<(), Error> {
         let mut ictx = input(&path).map_err(|_| Error::Uri)?;
         let video_stream = ictx.stream(video_stream_index).ok_or(Error::Caps)?;
@@ -608,15 +614,18 @@ impl Video {
             audio_resampler = Some(resampler);
         }
 
-        let mut prebuffering = true;
-        let has_audio = audio_decoder.is_some();
+        let mut buffering = true;
+        let mut frames_presented = 0u64;
+
+        log::info!("Decoder loop started");
 
         while alive.load(Ordering::Acquire) {
             // Process commands
             while let Ok(cmd) = command_rx.try_recv() {
                 match cmd {
-                    DecoderCommand::Seek(timestamp, _accurate) => {
-                        if let Err(e) = ictx.seek(timestamp, ..) {
+                    DecoderCommand::Seek(timestamp) => {
+                        log::info!("Seek to pts {}", timestamp);
+                        if let Err(e) = ictx.seek(timestamp, ..timestamp) {
                             log::error!("Seek failed: {:?}", e);
                         }
                         decoder.flush();
@@ -624,17 +633,19 @@ impl Video {
                             ad.flush();
                         }
                         is_eos.store(false, Ordering::Release);
-                        prebuffering = true;
+                        buffering = true;
                     }
-                    DecoderCommand::SetPaused(_) => {}
-                    DecoderCommand::SetSpeed(_) => {}
-                    DecoderCommand::Stop => return Ok(()),
+                    DecoderCommand::Stop => {
+                        log::info!("Stopping decoder");
+                        return Ok(());
+                    }
                 }
             }
 
             // Handle EOS
             if is_eos.load(Ordering::Acquire) {
                 if looping.load(Ordering::SeqCst) {
+                    log::info!("Looping");
                     if let Err(e) = ictx.seek(0, ..) {
                         log::error!("Loop seek failed: {:?}", e);
                     }
@@ -646,11 +657,10 @@ impl Video {
                     frame_buffer.lock().clear();
                     audio_ring.lock().clear();
                     samples_played.store(0, Ordering::SeqCst);
-                    *audio_clock.lock() = Duration::ZERO;
-                    *last_audio_pts.lock() = Duration::ZERO;
-                    *playback_start.lock() = None;
-                    *seek_target.lock() = None;
-                    prebuffering = true;
+                    *video_clock.lock() = Duration::ZERO;
+                    *audio_pts.lock() = Duration::ZERO;
+                    *last_clock_update.lock() = Instant::now();
+                    buffering = true;
                 } else {
                     std::thread::sleep(Duration::from_millis(16));
                     continue;
@@ -659,51 +669,131 @@ impl Video {
 
             let paused = is_paused.load(Ordering::Acquire);
 
-            // Pre-buffering phase
-            if prebuffering && !paused {
-                let vbuf_len = frame_buffer.lock().len();
-                let audio_buf_level = audio_ring.lock().available();
-
-                let video_ready = vbuf_len >= prebuffer_frames;
-                let audio_ready =
-                    !has_audio || audio_buf_level >= (output_sample_rate as usize / 2);
-
-                if video_ready && audio_ready {
-                    prebuffering = false;
-
-                    // Initialize playback timing
-                    if let Some(target) = seek_target.lock().take() {
-                        // After seek - use seek target
-                        *audio_clock.lock() = target;
-                        *last_audio_pts.lock() = target;
-                        let samples_for_target =
-                            (target.as_secs_f64() * output_sample_rate as f64 * 2.0) as u64;
-                        samples_played.store(samples_for_target, Ordering::SeqCst);
-                    } else {
-                        // Initial playback - start from zero
-                        *audio_clock.lock() = Duration::ZERO;
-                        *last_audio_pts.lock() = Duration::ZERO;
-                        samples_played.store(0, Ordering::SeqCst);
-                    }
-
-                    *playback_start.lock() = Some(Instant::now());
-                }
+            // Check for buffer underrun
+            let vbuf_len = frame_buffer.lock().len();
+            if !buffering && !paused && vbuf_len < 3 && !is_eos.load(Ordering::Acquire) {
+                log::warn!("Buffer critically low ({} frames)! Rebuffering...", vbuf_len);
+                buffering = true;
+                // Jump to buffering phase
+                continue;  // <-- ADD THIS!
             }
 
-            // Decode packets when not paused
+            // Buffering phase
+            if buffering {
+                let vbuf_len = frame_buffer.lock().len();
+                if vbuf_len >= prebuffer_frames {
+                    log::info!("Buffering done ({} frames)", vbuf_len);
+                    buffering = false;
+                    *last_clock_update.lock() = Instant::now();
+                }
+
+                // Decode aggressively
+                for _ in 0..5 {
+                    match Self::decode_next_packet(
+                        &mut ictx,
+                        &mut decoder,
+                        &mut scaler,
+                        audio_decoder.as_mut(),
+                        audio_resampler.as_mut(),
+                        video_stream_index,
+                        audio_stream_index,
+                        &frame_buffer,
+                        &frame_buffer_capacity,
+                        &audio_ring,
+                        &audio_pts,
+                        time_base,
+                        audio_time_base,
+                        output_sample_rate,
+                    ) {
+                        Ok(DecodeResult::Eos) => {
+                            is_eos.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(e) => {
+                            log::error!("Decode error: {:?}", e);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
             if paused {
                 std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
 
+            // Calculate master clock
+            let master_clock = if has_audio {
+                let played = samples_played.load(Ordering::SeqCst);
+                Duration::from_secs_f64(played as f64 / (output_sample_rate as f64 * 2.0))
+            } else {
+                let speed_val = f64::from_bits(speed.load(Ordering::SeqCst));
+                let elapsed = last_clock_update.lock().elapsed();
+                let clock = *video_clock.lock();
+                let new_clock = clock + Duration::from_secs_f64(elapsed.as_secs_f64() * speed_val);
+                *video_clock.lock() = new_clock;
+                *last_clock_update.lock() = Instant::now();
+                new_clock
+            };
+
+            // Present frames - SINGLE BLOCK ONLY!
+            {
+                let mut buf = frame_buffer.lock();
+
+                if let Some(next_frame) = buf.front() {
+                    let frame_time = next_frame.timestamp;
+                    let diff = master_clock.as_secs_f64() - frame_time.as_secs_f64();
+
+                    // Present if within tolerance OR buffer is critically low
+                    if diff >= -0.010 || buf.len() <= 3 {
+                        let presented = buf.pop_front().unwrap();
+                        drop(buf); // Release lock early!
+
+                        *frame.lock() = presented;
+                        frames_presented += 1;
+
+                        if frames_presented % 100 == 0 {
+                            log::debug!("Presented {} frames", frames_presented);
+                        }
+
+                        // Re-acquire lock for skipping
+                        let mut buf = frame_buffer.lock();
+
+                        // Less aggressive skip logic - limit to 5 frames per iteration
+                        let mut skipped = 0;
+                        while let Some(skip_frame) = buf.front() {
+                            if skipped >= 5 || buf.len() <= 3 {
+                                break; // Preserve minimum buffer
+                            }
+
+                            let skip_diff = master_clock.as_secs_f64() - skip_frame.timestamp.as_secs_f64();
+                            if skip_diff > 0.050 {
+                                buf.pop_front();
+                                skipped += 1;
+                                log::warn!("Skipped late frame ({:.1}ms behind), {} remaining",
+                                          skip_diff * 1000.0, buf.len());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Keep decoding
             let vbuf_len = frame_buffer.lock().len();
             let vbuf_cap = frame_buffer_capacity.load(Ordering::SeqCst);
-            let audio_space = audio_ring.lock().capacity - audio_ring.lock().len;
+            let audio_space = {
+                let ring = audio_ring.lock();
+                ring.capacity - ring.len
+            };
 
-            // Decode more aggressively during prebuffering
-            let should_decode = prebuffering
-                || vbuf_len < (vbuf_cap * 3 / 4)  // Keep buffer well filled
-                || audio_space > (output_sample_rate * 2) as usize / 4;
+            let should_decode = vbuf_len < (vbuf_cap * 3 / 4)
+                || audio_space > (output_sample_rate as usize / 2);
 
             if should_decode {
                 match Self::decode_next_packet(
@@ -717,113 +807,26 @@ impl Video {
                     &frame_buffer,
                     &frame_buffer_capacity,
                     &audio_ring,
-                    &last_audio_pts,
+                    &audio_pts,
                     time_base,
                     audio_time_base,
                     output_sample_rate,
                 ) {
-                    Ok(DecodeResult::Video) => {}
-                    Ok(DecodeResult::Audio) => {}
                     Ok(DecodeResult::Eos) => {
                         is_eos.store(true, Ordering::Release);
                     }
                     Err(e) => {
                         log::error!("Decode error: {:?}", e);
-                        std::thread::sleep(Duration::from_millis(10));
                     }
+                    _ => {}
                 }
             }
 
-            // Present frames at the correct time
-            if !prebuffering && !paused {
-                let current_speed = f64::from_bits(speed.load(Ordering::SeqCst));
-                let current_time = Self::get_playback_time(
-                    &playback_start,
-                    &samples_played,
-                    &audio_clock,
-                    output_sample_rate,
-                    has_audio,
-                    current_speed,
-                );
-
-                let mut buf = frame_buffer.lock();
-
-                if let Some(next_frame) = buf.front() {
-                    let frame_time = next_frame.timestamp;
-                    let time_until_present = frame_time.as_secs_f64() - current_time.as_secs_f64();
-
-                    if time_until_present <= 0.010 {
-                        // 10ms tolerance
-                        // Time to present this frame
-                        let presented = buf.pop_front().unwrap();
-                        current_pts.store(presented.pts as u64, Ordering::SeqCst);
-                        *frame.lock() = presented.clone();
-                        upload_frame.store(true, Ordering::SeqCst);
-
-                        // Skip frames if we're falling behind (> 50ms late)
-                        while let Some(next) = buf.front() {
-                            let next_time = next.timestamp.as_secs_f64();
-                            if next_time < current_time.as_secs_f64() - 0.050 {
-                                let skipped = buf.pop_front().unwrap();
-                                log::warn!(
-                                    "Skipped frame at {}s (behind by {}ms)",
-                                    next_time,
-                                    ((current_time.as_secs_f64() - next_time) * 1000.0) as i32
-                                );
-                                *frame.lock() = skipped;
-                            } else {
-                                break;
-                            }
-                        }
-                    } else if time_until_present > 0.020 {
-                        // Too early - sleep for a bit
-                        drop(buf);
-                        let sleep_ms =
-                            (time_until_present * 1000.0 / 2.0).min(10.0).max(1.0) as u64;
-                        std::thread::sleep(Duration::from_millis(sleep_ms));
-                        continue;
-                    }
-                }
-            }
-
-            // Adaptive sleep based on state
-            let sleep_ms = if prebuffering {
-                5 // Faster during prebuffer
-            } else if paused {
-                16
-            } else {
-                2 // Balance between responsiveness and CPU
-            };
-            std::thread::sleep(Duration::from_millis(sleep_ms));
+            // Minimal sleep
+            std::thread::sleep(Duration::from_millis(1));
         }
 
         Ok(())
-    }
-
-    fn get_playback_time(
-        playback_start: &Arc<Mutex<Option<Instant>>>,
-        samples_played: &Arc<AtomicU64>,
-        audio_clock: &Arc<Mutex<Duration>>,
-        sample_rate: u32,
-        has_audio: bool,
-        speed: f64,
-    ) -> Duration {
-        if has_audio {
-            // Audio clock is the master - use samples played
-            let played = samples_played.load(Ordering::SeqCst);
-            let audio_time = Duration::from_secs_f64(played as f64 / (sample_rate as f64 * 2.0));
-            *audio_clock.lock() = audio_time;
-            audio_time
-        } else {
-            // No audio - use system clock with speed adjustment
-            if let Some(start) = *playback_start.lock() {
-                let elapsed = start.elapsed();
-                let adjusted = Duration::from_secs_f64(elapsed.as_secs_f64() * speed);
-                adjusted
-            } else {
-                Duration::ZERO
-            }
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -838,7 +841,7 @@ impl Video {
         frame_buffer: &Arc<Mutex<VecDeque<Frame>>>,
         frame_buffer_capacity: &Arc<AtomicUsize>,
         audio_ring: &Arc<Mutex<AudioRingBuffer>>,
-        last_audio_pts: &Arc<Mutex<Duration>>,
+        audio_pts: &Arc<Mutex<Duration>>,
         video_time_base: ffmpeg::Rational,
         audio_time_base: ffmpeg::Rational,
         _output_sample_rate: u32,
@@ -920,11 +923,10 @@ impl Video {
 
                 let mut decoded = FFmpegAudioFrame::empty();
                 while audio_dec.receive_frame(&mut decoded).is_ok() {
-                    // Track audio PTS for sync
                     if let Some(pts) = decoded.pts() {
                         let audio_time_secs = pts as f64 * audio_time_base.numerator() as f64
                             / audio_time_base.denominator() as f64;
-                        *last_audio_pts.lock() = Duration::from_secs_f64(audio_time_secs.max(0.0));
+                        *audio_pts.lock() = Duration::from_secs_f64(audio_time_secs.max(0.0));
                     }
 
                     let mut resampled = FFmpegAudioFrame::empty();
@@ -942,15 +944,7 @@ impl Video {
                         samples.push(sample);
                     }
 
-                    let mut ring = audio_ring.lock();
-                    let written = ring.write(&samples);
-
-                    if written < samples.len() {
-                        log::warn!(
-                            "Audio buffer overflow, dropped {} samples",
-                            samples.len() - written
-                        );
-                    }
+                    audio_ring.lock().write(&samples);
 
                     return Ok(DecodeResult::Audio);
                 }
@@ -962,6 +956,7 @@ impl Video {
 
     fn setup_audio_output(
         audio_ring: Arc<Mutex<AudioRingBuffer>>,
+        _audio_pts: Arc<Mutex<Duration>>,
         volume: Arc<Mutex<f64>>,
         muted: Arc<AtomicBool>,
         is_paused: Arc<AtomicBool>,
@@ -988,6 +983,8 @@ impl Video {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        log::info!("Audio: {} Hz, {} channels", sample_rate, channels);
+
         let stream = device
             .build_output_stream(
                 &config,
@@ -1000,7 +997,6 @@ impl Video {
                     let mut ring = audio_ring.lock();
                     let read_count = ring.read(data);
 
-                    // Apply volume
                     let vol = *volume.lock();
                     let is_muted = muted.load(Ordering::Acquire);
 
@@ -1146,17 +1142,14 @@ impl Video {
 
     pub fn position(&self) -> Duration {
         let inner = self.read();
-
         if inner.has_audio {
-            *inner.audio_clock.lock()
+            let played = inner.samples_played.load(Ordering::SeqCst);
+            Duration::from_secs_f64(played as f64 / (inner.sample_rate as f64 * 2.0))
         } else {
-            let current_speed = f64::from_bits(inner.speed.load(Ordering::SeqCst));
-            if let Some(start) = *inner.playback_start.lock() {
-                let elapsed = start.elapsed();
-                Duration::from_secs_f64(elapsed.as_secs_f64() * current_speed)
-            } else {
-                Duration::ZERO
-            }
+            let speed = f64::from_bits(inner.speed.load(Ordering::SeqCst));
+            let elapsed = inner.last_clock_update.lock().elapsed();
+            let clock = *inner.video_clock.lock();
+            clock + Duration::from_secs_f64(elapsed.as_secs_f64() * speed)
         }
     }
 
@@ -1179,10 +1172,6 @@ impl Video {
         } else {
             None
         }
-    }
-
-    pub fn take_frame_ready(&self) -> bool {
-        self.read().upload_frame.swap(false, Ordering::SeqCst)
     }
 
     pub fn set_frame_buffer_capacity(&self, capacity: usize) {

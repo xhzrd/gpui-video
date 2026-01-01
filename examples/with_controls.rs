@@ -148,8 +148,8 @@ fn main() {
                 let options = VideoOptions {
                     looping: Some(true), // Enable looping
                     speed: Some(1.0),    // Normal speed
-                    frame_buffer_capacity: Some(180),
-                    prebuffer_frames: Some(60),
+                    frame_buffer_capacity: Some(60),
+                    prebuffer_frames: Some(10),
                 };
 
                 let video = Video::new_with_options(&uri, options).expect("failed to create video");
