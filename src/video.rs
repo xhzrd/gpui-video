@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 /// Position in the media.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Position {
-    /// Position based on time.
     Time(Duration),
-    /// Position based on nth frame.
     Frame(u64),
 }
 
@@ -57,7 +55,6 @@ impl Frame {
     }
 }
 
-/// Result of decoding a packet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeResult {
     Video,
@@ -65,7 +62,7 @@ enum DecodeResult {
     Eos,
 }
 
-// Ring buffer for audio to avoid allocations in audio callback
+// Improved ring buffer with better wraparound handling
 struct AudioRingBuffer {
     buffer: Vec<f32>,
     capacity: usize,
@@ -89,11 +86,20 @@ impl AudioRingBuffer {
         let available = self.capacity - self.len;
         let to_write = samples.len().min(available);
 
-        for sample in samples.iter().take(to_write) {
-            self.buffer[self.write_pos] = *sample;
-            self.write_pos = (self.write_pos + 1) % self.capacity;
+        if to_write == 0 {
+            return 0;
         }
 
+        let first_chunk = (self.capacity - self.write_pos).min(to_write);
+        self.buffer[self.write_pos..self.write_pos + first_chunk]
+            .copy_from_slice(&samples[..first_chunk]);
+
+        if first_chunk < to_write {
+            let remaining = to_write - first_chunk;
+            self.buffer[..remaining].copy_from_slice(&samples[first_chunk..to_write]);
+        }
+
+        self.write_pos = (self.write_pos + to_write) % self.capacity;
         self.len += to_write;
         to_write
     }
@@ -101,22 +107,23 @@ impl AudioRingBuffer {
     fn read(&mut self, output: &mut [f32]) -> usize {
         let available = self.len.min(output.len());
 
-        // Fast path: contiguous read
-        if self.read_pos + available <= self.capacity {
-            output[..available]
-                .copy_from_slice(&self.buffer[self.read_pos..self.read_pos + available]);
-            self.read_pos = (self.read_pos + available) % self.capacity; // FIX: Add modulo
-        } else {
-            // Wraparound case
-            for i in 0..available {
-                output[i] = self.buffer[self.read_pos];
-                self.read_pos = (self.read_pos + 1) % self.capacity;
-            }
+        if available == 0 {
+            output.fill(0.0);
+            return 0;
         }
 
+        let first_chunk = (self.capacity - self.read_pos).min(available);
+        output[..first_chunk]
+            .copy_from_slice(&self.buffer[self.read_pos..self.read_pos + first_chunk]);
+
+        if first_chunk < available {
+            let remaining = available - first_chunk;
+            output[first_chunk..available].copy_from_slice(&self.buffer[..remaining]);
+        }
+
+        self.read_pos = (self.read_pos + available) % self.capacity;
         self.len -= available;
 
-        // Fill remaining with silence
         if available < output.len() {
             output[available..].fill(0.0);
         }
@@ -135,26 +142,21 @@ impl AudioRingBuffer {
     }
 }
 
-/// Options for initializing a `Video` without post-construction locking.
 #[derive(Debug, Clone)]
 pub struct VideoOptions {
-    /// Optional initial frame buffer capacity (0 disables buffering). Defaults to 30.
     pub frame_buffer_capacity: Option<usize>,
-    /// Optional initial looping flag. Defaults to false.
     pub looping: Option<bool>,
-    /// Optional initial playback speed. Defaults to 1.0.
     pub speed: Option<f64>,
-    /// Pre-buffer frames before playback. Defaults to 5.
     pub prebuffer_frames: Option<usize>,
 }
 
 impl Default for VideoOptions {
     fn default() -> Self {
         Self {
-            frame_buffer_capacity: Some(30),
+            frame_buffer_capacity: Some(60), // Increased default buffer
             looping: Some(false),
             speed: Some(1.0),
-            prebuffer_frames: Some(5),
+            prebuffer_frames: Some(10), // Increased prebuffer
         }
     }
 }
@@ -184,13 +186,15 @@ pub(crate) struct Internal {
     pub(crate) audio_ring: Arc<Mutex<AudioRingBuffer>>,
     pub(crate) audio_clock: Arc<Mutex<Duration>>,
     pub(crate) samples_played: Arc<AtomicU64>,
+    pub(crate) last_audio_pts: Arc<Mutex<Duration>>, // NEW: Track actual audio PTS
 
     pub(crate) speed: Arc<AtomicU64>,
     pub(crate) looping: Arc<AtomicBool>,
     pub(crate) is_paused: Arc<AtomicBool>,
     pub(crate) is_eos: Arc<AtomicBool>,
     pub(crate) current_pts: Arc<AtomicU64>,
-    pub(crate) playback_start: Arc<Mutex<Option<(Instant, Duration)>>>,
+    pub(crate) playback_start: Arc<Mutex<Option<Instant>>>, // Simplified timing
+    pub(crate) seek_target: Arc<Mutex<Option<Duration>>>,   // NEW: Track seek target
 
     pub(crate) command_tx: Sender<DecoderCommand>,
     pub(crate) alive: Arc<AtomicBool>,
@@ -220,7 +224,6 @@ impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         let position = position.into();
 
-        // Calculate target time in seconds
         let target_seconds = match position {
             Position::Time(duration) => duration.as_secs_f64(),
             Position::Frame(frame_num) => {
@@ -229,23 +232,18 @@ impl Internal {
             }
         };
 
-        // Convert to timestamp for FFmpeg
         let timestamp = (target_seconds * self.time_base.denominator() as f64
             / self.time_base.numerator() as f64) as i64;
 
+        let target_duration = Duration::from_secs_f64(target_seconds);
+
+        // Clear state FIRST
         self.is_eos.store(false, Ordering::Release);
         self.frame_buffer.lock().clear();
         self.audio_ring.lock().clear();
 
-        // FIX: Set audio clock to the seek target time, not zero!
-        let target_duration = Duration::from_secs_f64(target_seconds);
-        *self.audio_clock.lock() = target_duration;
-
-        // FIX: Calculate samples_played for the target time
-        let samples_for_target = (target_seconds * self.sample_rate as f64 * 2.0) as u64;
-        self.samples_played
-            .store(samples_for_target, Ordering::SeqCst);
-
+        // Set seek target - decoder will handle the rest
+        *self.seek_target.lock() = Some(target_duration);
         *self.playback_start.lock() = None;
 
         self.command_tx
@@ -261,6 +259,7 @@ impl Internal {
         }
 
         self.speed.store(speed.to_bits(), Ordering::SeqCst);
+        *self.playback_start.lock() = None; // Reset timing
 
         self.command_tx
             .send(DecoderCommand::SetSpeed(speed))
@@ -273,8 +272,7 @@ impl Internal {
         let was_paused = self.is_paused.swap(paused, Ordering::SeqCst);
 
         if was_paused && !paused {
-            // Resuming - reset timing
-            *self.playback_start.lock() = None;
+            *self.playback_start.lock() = None; // Reset timing on resume
         }
 
         let _ = self.command_tx.send(DecoderCommand::SetPaused(paused));
@@ -289,7 +287,6 @@ impl Internal {
     }
 }
 
-/// A multimedia video loaded from a URI (e.g., a local file path or HTTP stream).
 #[derive(Debug, Clone)]
 pub struct Video(pub(crate) Arc<RwLock<Internal>>);
 
@@ -313,13 +310,10 @@ impl Drop for Video {
 }
 
 impl Video {
-    /// Create a new video player from a given video which loads from `uri`.
     pub fn new(uri: &url::Url) -> Result<Self, Error> {
         Self::new_with_options(uri, VideoOptions::default())
     }
 
-    /// Create a new video player from a given video which loads from `uri`,
-    /// applying initialization options.
     pub fn new_with_options(uri: &url::Url, options: VideoOptions) -> Result<Self, Error> {
         ffmpeg::init().map_err(|_| {
             Error::Io(std::io::Error::new(
@@ -342,11 +336,9 @@ impl Video {
 
         let ictx = input(&path).map_err(|_| Error::Uri)?;
 
-        // Find video stream
         let video_stream = ictx.streams().best(Type::Video).ok_or(Error::Caps)?;
         let video_stream_index = video_stream.index();
 
-        // Get codec parameters
         let codec_params = video_stream.parameters();
         let _codec = ffmpeg::codec::decoder::find(codec_params.id())
             .ok_or(Error::Caps)?
@@ -368,7 +360,6 @@ impl Video {
         let height = decoder.height() as i32;
         let time_base = video_stream.time_base();
 
-        // Calculate framerate
         let framerate = {
             let avg_frame_rate = video_stream.avg_frame_rate();
             if avg_frame_rate.numerator() > 0 && avg_frame_rate.denominator() > 0 {
@@ -382,49 +373,45 @@ impl Video {
             return Err(Error::Framerate(framerate));
         }
 
-        // Get duration
         let duration = if ictx.duration() > 0 {
             Duration::from_micros(ictx.duration() as u64)
         } else {
             Duration::from_secs(0)
         };
 
-        // Check for audio stream
         let audio_stream = ictx.streams().best(Type::Audio);
         let has_audio = audio_stream.is_some();
         let audio_stream_index = audio_stream.map(|s| s.index());
 
-        // Initialize shared state
         let frame = Arc::new(Mutex::new(Frame::empty()));
         let upload_frame = Arc::new(AtomicBool::new(false));
         let frame_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(
-            options.frame_buffer_capacity.unwrap_or(30),
+            options.frame_buffer_capacity.unwrap_or(60),
         )));
         let frame_buffer_capacity = Arc::new(AtomicUsize::new(
-            options.frame_buffer_capacity.unwrap_or(30),
+            options.frame_buffer_capacity.unwrap_or(60),
         ));
 
-        // Audio ring buffer - 2 seconds at 48kHz stereo
-        let audio_ring = Arc::new(Mutex::new(AudioRingBuffer::new(48000 * 2 * 4)));
+        // Reduced audio buffer - 1 second is plenty
+        let audio_ring = Arc::new(Mutex::new(AudioRingBuffer::new(48000 * 2 * 2)));
         let audio_clock = Arc::new(Mutex::new(Duration::ZERO));
         let samples_played = Arc::new(AtomicU64::new(0));
+        let last_audio_pts = Arc::new(Mutex::new(Duration::ZERO));
 
         let speed = Arc::new(AtomicU64::new(options.speed.unwrap_or(1.0).to_bits()));
         let looping = Arc::new(AtomicBool::new(options.looping.unwrap_or(false)));
-        let is_paused = Arc::new(AtomicBool::new(false)); // Start playing by default
+        let is_paused = Arc::new(AtomicBool::new(false));
         let is_eos = Arc::new(AtomicBool::new(false));
         let current_pts = Arc::new(AtomicU64::new(0));
         let alive = Arc::new(AtomicBool::new(true));
         let volume = Arc::new(Mutex::new(1.0));
         let muted = Arc::new(AtomicBool::new(false));
-        let playback_start = Arc::new(Mutex::new(None::<(Instant, Duration)>));
+        let playback_start = Arc::new(Mutex::new(None::<Instant>));
+        let seek_target = Arc::new(Mutex::new(None::<Duration>));
 
-        let (command_tx, command_rx): (Sender<DecoderCommand>, Receiver<DecoderCommand>) =
-            bounded(100);
+        let (command_tx, command_rx) = bounded(100);
+        let prebuffer_frames = options.prebuffer_frames.unwrap_or(10);
 
-        let prebuffer_frames = options.prebuffer_frames.unwrap_or(5);
-
-        // Setup audio output first to get sample rate
         let (audio_stream, actual_sample_rate) = if has_audio {
             let audio_ring_for_output = Arc::clone(&audio_ring);
             let volume_for_output = Arc::clone(&volume);
@@ -449,7 +436,7 @@ impl Video {
             (None, 48000)
         };
 
-        // Clone references for decoder thread
+        // Clone all Arc references for decoder thread
         let frame_ref = Arc::clone(&frame);
         let upload_frame_ref = Arc::clone(&upload_frame);
         let frame_buffer_ref = Arc::clone(&frame_buffer);
@@ -457,6 +444,7 @@ impl Video {
         let audio_ring_ref = Arc::clone(&audio_ring);
         let audio_clock_ref = Arc::clone(&audio_clock);
         let samples_played_ref = Arc::clone(&samples_played);
+        let last_audio_pts_ref = Arc::clone(&last_audio_pts);
         let speed_ref = Arc::clone(&speed);
         let looping_ref = Arc::clone(&looping);
         let is_paused_ref = Arc::clone(&is_paused);
@@ -464,8 +452,8 @@ impl Video {
         let current_pts_ref = Arc::clone(&current_pts);
         let alive_ref = Arc::clone(&alive);
         let playback_start_ref = Arc::clone(&playback_start);
+        let seek_target_ref = Arc::clone(&seek_target);
 
-        // Spawn decoder thread
         let decoder_thread = std::thread::spawn(move || {
             if let Err(e) = Self::decoder_loop(
                 path,
@@ -478,6 +466,7 @@ impl Video {
                 audio_ring_ref,
                 audio_clock_ref,
                 samples_played_ref,
+                last_audio_pts_ref,
                 speed_ref,
                 looping_ref,
                 is_paused_ref,
@@ -485,6 +474,7 @@ impl Video {
                 current_pts_ref,
                 alive_ref,
                 playback_start_ref,
+                seek_target_ref,
                 command_rx,
                 time_base,
                 framerate,
@@ -513,6 +503,7 @@ impl Video {
             audio_ring,
             audio_clock,
             samples_played,
+            last_audio_pts,
 
             speed,
             looping,
@@ -520,6 +511,7 @@ impl Video {
             is_eos,
             current_pts,
             playback_start,
+            seek_target,
 
             command_tx,
             alive,
@@ -546,13 +538,15 @@ impl Video {
         audio_ring: Arc<Mutex<AudioRingBuffer>>,
         audio_clock: Arc<Mutex<Duration>>,
         samples_played: Arc<AtomicU64>,
+        last_audio_pts: Arc<Mutex<Duration>>,
         speed: Arc<AtomicU64>,
         looping: Arc<AtomicBool>,
         is_paused: Arc<AtomicBool>,
         is_eos: Arc<AtomicBool>,
         current_pts: Arc<AtomicU64>,
         alive: Arc<AtomicBool>,
-        playback_start: Arc<Mutex<Option<(Instant, Duration)>>>,
+        playback_start: Arc<Mutex<Option<Instant>>>,
+        seek_target: Arc<Mutex<Option<Duration>>>,
         command_rx: Receiver<DecoderCommand>,
         time_base: ffmpeg::Rational,
         framerate: f64,
@@ -563,11 +557,6 @@ impl Video {
         let video_stream = ictx.stream(video_stream_index).ok_or(Error::Caps)?;
 
         let codec_params = video_stream.parameters();
-        let _codec = ffmpeg::codec::decoder::find(codec_params.id())
-            .ok_or(Error::Caps)?
-            .video()
-            .map_err(|_| Error::Cast)?;
-
         let mut decoder = ffmpeg::codec::context::Context::from_parameters(codec_params)
             .map_err(|_| Error::Caps)?
             .decoder()
@@ -579,7 +568,6 @@ impl Video {
             count: 0,
         });
 
-        // Setup video scaler
         let mut scaler = ScaleContext::get(
             decoder.format(),
             decoder.width(),
@@ -591,7 +579,6 @@ impl Video {
         )
         .map_err(|_| Error::Caps)?;
 
-        // Setup audio decoder if available
         let mut audio_decoder = None;
         let mut audio_resampler = None;
         let mut audio_time_base = ffmpeg::Rational::new(1, 1);
@@ -601,18 +588,12 @@ impl Video {
             audio_time_base = audio_stream.time_base();
 
             let audio_params = audio_stream.parameters();
-            let _audio_codec = ffmpeg::codec::decoder::find(audio_params.id())
-                .ok_or(Error::Caps)?
-                .audio()
-                .map_err(|_| Error::Cast)?;
-
             let dec = ffmpeg::codec::context::Context::from_parameters(audio_params)
                 .map_err(|_| Error::Caps)?
                 .decoder()
                 .audio()
                 .map_err(|_| Error::Cast)?;
 
-            // Setup resampler to stereo f32 at device sample rate
             let resampler = ResampleContext::get(
                 dec.format(),
                 dec.channel_layout(),
@@ -628,7 +609,7 @@ impl Video {
         }
 
         let mut prebuffering = true;
-        let frame_duration = Duration::from_secs_f64(1.0 / framerate);
+        let has_audio = audio_decoder.is_some();
 
         while alive.load(Ordering::Acquire) {
             // Process commands
@@ -643,27 +624,11 @@ impl Video {
                             ad.flush();
                         }
                         is_eos.store(false, Ordering::Release);
-                        current_pts.store(timestamp as u64, Ordering::SeqCst);
-                        frame_buffer.lock().clear();
-                        audio_ring.lock().clear();
-
-                        // FIX: Don't reset samples_played - already set by seek() function
-                        // Remove these lines:
-                        // samples_played.store(0, Ordering::SeqCst);
-
                         prebuffering = true;
-                        *playback_start.lock() = None;
                     }
-                    DecoderCommand::SetPaused(_paused) => {
-                        // Handled by atomic
-                    }
-                    DecoderCommand::SetSpeed(_new_speed) => {
-                        // Speed is handled by atomic, but reset timing
-                        *playback_start.lock() = None;
-                    }
-                    DecoderCommand::Stop => {
-                        return Ok(());
-                    }
+                    DecoderCommand::SetPaused(_) => {}
+                    DecoderCommand::SetSpeed(_) => {}
+                    DecoderCommand::Stop => return Ok(()),
                 }
             }
 
@@ -678,15 +643,16 @@ impl Video {
                         ad.flush();
                     }
                     is_eos.store(false, Ordering::Release);
-                    current_pts.store(0, Ordering::SeqCst);
                     frame_buffer.lock().clear();
                     audio_ring.lock().clear();
                     samples_played.store(0, Ordering::SeqCst);
                     *audio_clock.lock() = Duration::ZERO;
+                    *last_audio_pts.lock() = Duration::ZERO;
                     *playback_start.lock() = None;
+                    *seek_target.lock() = None;
                     prebuffering = true;
                 } else {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(16));
                     continue;
                 }
             }
@@ -696,54 +662,48 @@ impl Video {
             // Pre-buffering phase
             if prebuffering && !paused {
                 let vbuf_len = frame_buffer.lock().len();
-                if vbuf_len >= prebuffer_frames.max(10) {
+                let audio_buf_level = audio_ring.lock().available();
+
+                let video_ready = vbuf_len >= prebuffer_frames;
+                let audio_ready =
+                    !has_audio || audio_buf_level >= (output_sample_rate as usize / 2);
+
+                if video_ready && audio_ready {
                     prebuffering = false;
 
-                    if let Some(first_frame) = frame_buffer.lock().front() {
-                        let first_ts = first_frame.timestamp;
-
-                        // FIX: Only set playback_start once with the correct timestamp
-                        if audio_decoder.is_some() {
-                            let current_audio_clock = *audio_clock.lock();
-
-                            if current_audio_clock == Duration::ZERO {
-                                // Initial playback - use first frame timestamp
-                                *audio_clock.lock() = first_ts;
-                                let samples_for_ts =
-                                    (first_ts.as_secs_f64() * output_sample_rate as f64 * 2.0)
-                                        as u64;
-                                samples_played.store(samples_for_ts, Ordering::SeqCst);
-                                *playback_start.lock() = Some((Instant::now(), first_ts));
-                            } else {
-                                // After seek - use current audio clock (already set by seek)
-                                *playback_start.lock() =
-                                    Some((Instant::now(), current_audio_clock));
-                            }
-                        } else {
-                            // No audio - use first frame timestamp
-                            *playback_start.lock() = Some((Instant::now(), first_ts));
-                        }
+                    // Initialize playback timing
+                    if let Some(target) = seek_target.lock().take() {
+                        // After seek - use seek target
+                        *audio_clock.lock() = target;
+                        *last_audio_pts.lock() = target;
+                        let samples_for_target =
+                            (target.as_secs_f64() * output_sample_rate as f64 * 2.0) as u64;
+                        samples_played.store(samples_for_target, Ordering::SeqCst);
+                    } else {
+                        // Initial playback - start from zero
+                        *audio_clock.lock() = Duration::ZERO;
+                        *last_audio_pts.lock() = Duration::ZERO;
+                        samples_played.store(0, Ordering::SeqCst);
                     }
+
+                    *playback_start.lock() = Some(Instant::now());
                 }
             }
 
-            // Decode packets
+            // Decode packets when not paused
             if paused {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(16));
                 continue;
             }
 
             let vbuf_len = frame_buffer.lock().len();
             let vbuf_cap = frame_buffer_capacity.load(Ordering::SeqCst);
-            let audio_space = {
-                let ring = audio_ring.lock();
-                ring.capacity - ring.len
-            };
+            let audio_space = audio_ring.lock().capacity - audio_ring.lock().len;
 
-            // Keep buffers full
+            // Decode more aggressively during prebuffering
             let should_decode = prebuffering
-                || vbuf_len < vbuf_cap
-                || audio_space > (output_sample_rate * 2) as usize;
+                || vbuf_len < (vbuf_cap * 3 / 4)  // Keep buffer well filled
+                || audio_space > (output_sample_rate * 2) as usize / 4;
 
             if should_decode {
                 match Self::decode_next_packet(
@@ -757,6 +717,7 @@ impl Video {
                     &frame_buffer,
                     &frame_buffer_capacity,
                     &audio_ring,
+                    &last_audio_pts,
                     time_base,
                     audio_time_base,
                     output_sample_rate,
@@ -781,63 +742,66 @@ impl Video {
                     &samples_played,
                     &audio_clock,
                     output_sample_rate,
-                    audio_decoder.is_some(),
+                    has_audio,
                     current_speed,
                 );
 
                 let mut buf = frame_buffer.lock();
 
-                // Simplified: present frame if its time has come
                 if let Some(next_frame) = buf.front() {
-                    let frame_time = next_frame.timestamp.as_secs_f64();
-                    let current_time_secs = current_time.as_secs_f64();
-                    let time_diff = current_time_secs - frame_time;
+                    let frame_time = next_frame.timestamp;
+                    let time_until_present = frame_time.as_secs_f64() - current_time.as_secs_f64();
 
-                    // Present if we're at or past the frame's time (within small tolerance)
-                    // Present if we're at or past the frame's time (tighter tolerance)
-                    if time_diff >= -0.002 {
-                        // 2ms tolerance instead of 5ms
+                    if time_until_present <= 0.010 {
+                        // 10ms tolerance
+                        // Time to present this frame
                         let presented = buf.pop_front().unwrap();
                         current_pts.store(presented.pts as u64, Ordering::SeqCst);
-                        *frame.lock() = presented;
+                        *frame.lock() = presented.clone();
                         upload_frame.store(true, Ordering::SeqCst);
 
-                        // Don't skip frames unless we're significantly behind
-                        let mut skip_count = 0;
-                        while !buf.is_empty()
-                            && skip_count < 1
-                            && buf.front().unwrap().timestamp.as_secs_f64()
-                                < (current_time_secs - 0.100)
-                        // 100ms behind
-                        {
-                            if let Some(skip_frame) = buf.pop_front() {
-                                *frame.lock() = skip_frame.clone();
-                                skip_count += 1;
+                        // Skip frames if we're falling behind (> 50ms late)
+                        while let Some(next) = buf.front() {
+                            let next_time = next.timestamp.as_secs_f64();
+                            if next_time < current_time.as_secs_f64() - 0.050 {
+                                let skipped = buf.pop_front().unwrap();
                                 log::warn!(
-                                    "Dropped frame - {}s behind",
-                                    current_time_secs - skip_frame.timestamp.as_secs_f64()
+                                    "Skipped frame at {}s (behind by {}ms)",
+                                    next_time,
+                                    ((current_time.as_secs_f64() - next_time) * 1000.0) as i32
                                 );
+                                *frame.lock() = skipped;
+                            } else {
+                                break;
                             }
                         }
-                    } else if time_diff < -0.010 {
-                        // 10ms early
-                        // Too early - wait
+                    } else if time_until_present > 0.020 {
+                        // Too early - sleep for a bit
                         drop(buf);
-                        std::thread::sleep(Duration::from_millis(2));
+                        let sleep_ms =
+                            (time_until_present * 1000.0 / 2.0).min(10.0).max(1.0) as u64;
+                        std::thread::sleep(Duration::from_millis(sleep_ms));
                         continue;
                     }
                 }
             }
 
-            // Sleep to prevent busy-waiting
-            std::thread::sleep(Duration::from_millis(if prebuffering { 10 } else { 1 }));
+            // Adaptive sleep based on state
+            let sleep_ms = if prebuffering {
+                5 // Faster during prebuffer
+            } else if paused {
+                16
+            } else {
+                2 // Balance between responsiveness and CPU
+            };
+            std::thread::sleep(Duration::from_millis(sleep_ms));
         }
 
         Ok(())
     }
 
     fn get_playback_time(
-        playback_start: &Arc<Mutex<Option<(Instant, Duration)>>>,
+        playback_start: &Arc<Mutex<Option<Instant>>>,
         samples_played: &Arc<AtomicU64>,
         audio_clock: &Arc<Mutex<Duration>>,
         sample_rate: u32,
@@ -845,24 +809,17 @@ impl Video {
         speed: f64,
     ) -> Duration {
         if has_audio {
-            // Use audio clock - most accurate
+            // Audio clock is the master - use samples played
             let played = samples_played.load(Ordering::SeqCst);
-
-            // Calculate actual time from samples
-            // For stereo: samples_played = total f32 values = frames * 2
-            // So: seconds = samples_played / (sample_rate * channels)
             let audio_time = Duration::from_secs_f64(played as f64 / (sample_rate as f64 * 2.0));
-
-            // Update the shared audio clock
             *audio_clock.lock() = audio_time;
-
             audio_time
         } else {
-            // Use system clock with speed adjustment
-            if let Some((start_instant, start_time)) = *playback_start.lock() {
-                let elapsed = start_instant.elapsed();
-                let scaled_elapsed = Duration::from_secs_f64(elapsed.as_secs_f64() * speed);
-                start_time + scaled_elapsed
+            // No audio - use system clock with speed adjustment
+            if let Some(start) = *playback_start.lock() {
+                let elapsed = start.elapsed();
+                let adjusted = Duration::from_secs_f64(elapsed.as_secs_f64() * speed);
+                adjusted
             } else {
                 Duration::ZERO
             }
@@ -881,6 +838,7 @@ impl Video {
         frame_buffer: &Arc<Mutex<VecDeque<Frame>>>,
         frame_buffer_capacity: &Arc<AtomicUsize>,
         audio_ring: &Arc<Mutex<AudioRingBuffer>>,
+        last_audio_pts: &Arc<Mutex<Duration>>,
         video_time_base: ffmpeg::Rational,
         audio_time_base: ffmpeg::Rational,
         _output_sample_rate: u32,
@@ -892,7 +850,6 @@ impl Video {
 
         let stream_index = stream.index();
 
-        // Handle video packet
         if stream_index == video_stream_index {
             if let Err(e) = decoder.send_packet(&packet) {
                 log::warn!("Send video packet error: {:?}", e);
@@ -909,7 +866,6 @@ impl Video {
 
                 let width = nv12_frame.width();
                 let height = nv12_frame.height();
-
                 let y_plane = nv12_frame.data(0);
                 let uv_plane = nv12_frame.data(1);
                 let y_stride = nv12_frame.stride(0) as usize;
@@ -955,7 +911,6 @@ impl Video {
             }
         }
 
-        // Handle audio packet
         if Some(stream_index) == audio_stream_index {
             if let (Some(audio_dec), Some(audio_res)) = (audio_decoder, audio_resampler) {
                 if let Err(e) = audio_dec.send_packet(&packet) {
@@ -965,15 +920,21 @@ impl Video {
 
                 let mut decoded = FFmpegAudioFrame::empty();
                 while audio_dec.receive_frame(&mut decoded).is_ok() {
+                    // Track audio PTS for sync
+                    if let Some(pts) = decoded.pts() {
+                        let audio_time_secs = pts as f64 * audio_time_base.numerator() as f64
+                            / audio_time_base.denominator() as f64;
+                        *last_audio_pts.lock() = Duration::from_secs_f64(audio_time_secs.max(0.0));
+                    }
+
                     let mut resampled = FFmpegAudioFrame::empty();
                     if let Err(e) = audio_res.run(&decoded, &mut resampled) {
                         log::error!("Resampling error: {:?}", e);
                         continue;
                     }
 
-                    // Extract f32 stereo samples
                     let plane = resampled.data(0);
-                    let sample_count = resampled.samples() * 2; // stereo
+                    let sample_count = resampled.samples() * 2;
 
                     let mut samples = Vec::with_capacity(sample_count);
                     for chunk in plane.chunks_exact(4).take(sample_count) {
@@ -981,7 +942,6 @@ impl Video {
                         samples.push(sample);
                     }
 
-                    // Write to ring buffer
                     let mut ring = audio_ring.lock();
                     let written = ring.write(&samples);
 
@@ -1006,7 +966,7 @@ impl Video {
         muted: Arc<AtomicBool>,
         is_paused: Arc<AtomicBool>,
         samples_played: Arc<AtomicU64>,
-    ) -> Result<(Stream, u32), Error> {
+    ) -> Result<(Stream, cpal::SampleRate), Error> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or_else(|| {
             Error::Io(std::io::Error::new(
@@ -1020,8 +980,6 @@ impl Video {
             .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let sample_rate = supported_config.sample_rate();
-        let sample_rate_hz = sample_rate;
-
         let channels = supported_config.channels();
 
         let config = StreamConfig {
@@ -1042,15 +1000,6 @@ impl Video {
                     let mut ring = audio_ring.lock();
                     let read_count = ring.read(data);
 
-                    // FIX: Detect underruns and log them
-                    if read_count < data.len() {
-                        log::warn!(
-                            "Audio buffer underrun: {} / {} samples available",
-                            read_count,
-                            data.len()
-                        );
-                    }
-
                     // Apply volume
                     let vol = *volume.lock();
                     let is_muted = muted.load(Ordering::Acquire);
@@ -1063,7 +1012,6 @@ impl Video {
                         }
                     }
 
-                    // Update samples played counter
                     samples_played.fetch_add(read_count as u64, Ordering::SeqCst);
                 },
                 |err| log::error!("Audio stream error: {:?}", err),
@@ -1075,7 +1023,7 @@ impl Video {
             .play()
             .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
-        Ok((stream, sample_rate_hz))
+        Ok((stream, sample_rate))
     }
 
     pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, Internal> {
@@ -1086,17 +1034,14 @@ impl Video {
         self.0.write()
     }
 
-    /// Check if this video has an audio track.
     pub fn has_audio(&self) -> bool {
         self.read().has_audio
     }
 
-    /// Get the size/resolution of the video as `(width, height)`.
     pub fn size(&self) -> (i32, i32) {
         (self.read().width, self.read().height)
     }
 
-    /// Get the natural aspect ratio (width / height) of the video as f32.
     pub fn aspect_ratio(&self) -> f32 {
         let (w, h) = self.size();
         if w <= 0 || h <= 0 {
@@ -1105,24 +1050,20 @@ impl Video {
         w as f32 / h as f32
     }
 
-    /// Set an override display width in pixels. Pass `None` to clear.
     pub fn set_display_width(&self, width: Option<u32>) {
         self.write().display_width_override = width;
     }
 
-    /// Set an override display height in pixels. Pass `None` to clear.
     pub fn set_display_height(&self, height: Option<u32>) {
         self.write().display_height_override = height;
     }
 
-    /// Set override display size in pixels. Any value set to `None` is cleared.
     pub fn set_display_size(&self, width: Option<u32>, height: Option<u32>) {
         let mut inner = self.write();
         inner.display_width_override = width;
         inner.display_height_override = height;
     }
 
-    /// Get the effective display size honoring overrides.
     pub fn display_size(&self) -> (u32, u32) {
         let inner = self.read();
         let natural_w = inner.width.max(0) as u32;
@@ -1151,72 +1092,58 @@ impl Video {
         }
     }
 
-    /// Get the framerate of the video as frames per second.
     pub fn framerate(&self) -> f64 {
         self.read().framerate
     }
 
-    /// Set the volume multiplier of the audio.
     pub fn set_volume(&self, volume: f64) {
         *self.read().volume.lock() = volume.clamp(0.0, 1.0);
     }
 
-    /// Get the volume multiplier of the audio.
     pub fn volume(&self) -> f64 {
         *self.read().volume.lock()
     }
 
-    /// Set if the audio is muted or not.
     pub fn set_muted(&self, muted: bool) {
         self.read().muted.store(muted, Ordering::SeqCst);
     }
 
-    /// Get if the audio is muted or not.
     pub fn muted(&self) -> bool {
         self.read().muted.load(Ordering::Acquire)
     }
 
-    /// Get if the stream ended or not.
     pub fn eos(&self) -> bool {
         self.read().is_eos.load(Ordering::Acquire)
     }
 
-    /// Get if the media will loop or not.
     pub fn looping(&self) -> bool {
         self.read().looping.load(Ordering::SeqCst)
     }
 
-    /// Set if the media will loop or not.
     pub fn set_looping(&self, looping: bool) {
         self.write().looping.store(looping, Ordering::SeqCst);
     }
 
-    /// Set if the media is paused or not.
     pub fn set_paused(&self, paused: bool) {
         self.write().set_paused(paused)
     }
 
-    /// Get if the media is paused or not.
     pub fn paused(&self) -> bool {
         self.read().paused()
     }
 
-    /// Jumps to a specific position in the media.
     pub fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
         self.write().seek(position, accurate)
     }
 
-    /// Set the playback speed of the media.
     pub fn set_speed(&self, speed: f64) -> Result<(), Error> {
         self.write().set_speed(speed)
     }
 
-    /// Get the current playback speed.
     pub fn speed(&self) -> f64 {
         f64::from_bits(self.read().speed.load(Ordering::SeqCst))
     }
 
-    /// Get the current playback position in time.
     pub fn position(&self) -> Duration {
         let inner = self.read();
 
@@ -1224,29 +1151,25 @@ impl Video {
             *inner.audio_clock.lock()
         } else {
             let current_speed = f64::from_bits(inner.speed.load(Ordering::SeqCst));
-            if let Some((start_instant, start_time)) = *inner.playback_start.lock() {
-                let elapsed = start_instant.elapsed();
-                let scaled_elapsed = Duration::from_secs_f64(elapsed.as_secs_f64() * current_speed);
-                start_time + scaled_elapsed
+            if let Some(start) = *inner.playback_start.lock() {
+                let elapsed = start.elapsed();
+                Duration::from_secs_f64(elapsed.as_secs_f64() * current_speed)
             } else {
                 Duration::ZERO
             }
         }
     }
 
-    /// Get the media duration.
     pub fn duration(&self) -> Duration {
         self.read().duration
     }
 
-    /// Restarts a stream.
     pub fn restart_stream(&self) -> Result<(), Error> {
         self.write().is_eos.store(false, Ordering::Release);
         self.set_paused(false);
         self.seek(0, false)
     }
 
-    /// Get the current NV12 frame data if available.
     pub fn current_frame_data(&self) -> Option<(Vec<u8>, u32, u32)> {
         let inner = self.read();
         let frame = inner.frame.lock();
@@ -1258,12 +1181,10 @@ impl Video {
         }
     }
 
-    /// Returns true if a new frame arrived since last check and resets the flag.
     pub fn take_frame_ready(&self) -> bool {
         self.read().upload_frame.swap(false, Ordering::SeqCst)
     }
 
-    /// Configure the frame buffer capacity (0 disables buffering).
     pub fn set_frame_buffer_capacity(&self, capacity: usize) {
         let inner = self.read();
         inner
@@ -1280,12 +1201,10 @@ impl Video {
         }
     }
 
-    /// Retrieve the current frame buffer capacity.
     pub fn frame_buffer_capacity(&self) -> usize {
         self.read().frame_buffer_capacity.load(Ordering::SeqCst)
     }
 
-    /// Pop the oldest buffered frame, returning raw NV12 bytes with width/height.
     pub fn pop_buffered_frame(&self) -> Option<(Vec<u8>, u32, u32)> {
         let inner = self.read();
         let maybe_frame = inner.frame_buffer.lock().pop_front();
@@ -1293,12 +1212,10 @@ impl Video {
         maybe_frame.map(|frame| (frame.data, frame.width, frame.height))
     }
 
-    /// Number of frames currently buffered.
     pub fn buffered_len(&self) -> usize {
         self.read().frame_buffer.lock().len()
     }
 
-    /// Get audio buffer fill level (0.0 to 1.0).
     pub fn audio_buffer_level(&self) -> f32 {
         let inner = self.read();
         let ring = inner.audio_ring.lock();

@@ -16,7 +16,6 @@ use gpui::{
 use std::sync::Arc;
 use yuv::{yuv_nv12_to_bgra, YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix};
 
-/// A video element that implements Element trait similar to GPUI's img element
 pub struct VideoElement {
     video: Video,
     display_width: Option<gpui::Pixels>,
@@ -45,28 +44,23 @@ impl VideoElement {
         self
     }
 
-    /// Set only width; height is inferred via aspect ratio.
     pub fn width(mut self, width: gpui::Pixels) -> Self {
         self.display_width = Some(width);
         self.display_height = None;
         self
     }
 
-    /// Set only height; width is inferred via aspect ratio.
     pub fn height(mut self, height: gpui::Pixels) -> Self {
         self.display_height = Some(height);
         self.display_width = None;
         self
     }
 
-    /// Configure how many frames to buffer inside the underlying `Video`.
-    /// 0 disables buffering and behaves like immediate rendering.
     pub fn buffer_capacity(self, capacity: usize) -> Self {
         self.video.set_frame_buffer_capacity(capacity);
         self
     }
 
-    /// Get the current display dimensions, falling back to video's effective display size.
     fn get_display_size(&self) -> (gpui::Pixels, gpui::Pixels) {
         match (self.display_width, self.display_height) {
             (Some(w), Some(h)) => (w, h),
@@ -77,7 +71,6 @@ impl VideoElement {
         }
     }
 
-    /// Compute aspect-fit destination bounds inside the given container `bounds`.
     fn fitted_bounds(
         &self,
         bounds: gpui::Bounds<gpui::Pixels>,
@@ -109,7 +102,6 @@ impl VideoElement {
         )
     }
 
-    /// Paint using GPUI sprite atlas with a BGRA buffer, while evicting the previous frame's texture.
     fn paint_render_image(
         &mut self,
         window: &mut Window,
@@ -134,11 +126,9 @@ impl VideoElement {
 
             let dest_bounds = self.fitted_bounds(bounds, frame_width, frame_height);
 
-            // Swap and remember the previous image so we can drop it after painting
             let prev_image: Option<Arc<gpui::RenderImage>> =
                 last_render_image.update(cx, |this, _| this.replace(render_image.clone()));
 
-            // Paint the image within the fitted bounds (letterboxed/pillarboxed)
             window
                 .paint_image(
                     dest_bounds,
@@ -149,14 +139,12 @@ impl VideoElement {
                 )
                 .ok();
 
-            // Drop the previously uploaded image after painting to avoid atlas growth
             if let Some(prev) = prev_image {
                 cx.drop_image(prev, Some(window));
             }
         }
     }
 
-    /// macOS-only: Try to render NV12 via CVPixelBuffer and paint_surface. Returns true if painted.
     #[cfg(target_os = "macos")]
     fn try_paint_surface_macos(
         &mut self,
@@ -174,7 +162,6 @@ impl VideoElement {
             return false;
         }
 
-        // Build attributes: Metal compatible + backed by IOSurface
         let mut attrs: CFMutableDictionary<CFString, core_foundation::base::CFType> =
             CFMutableDictionary::new();
         attrs.add(
@@ -197,7 +184,6 @@ impl VideoElement {
             return false;
         };
 
-        // Validate pixel buffer layout before unsafe copies; fall back if anything is off.
         let pf = pixel_buffer.get_pixel_format();
         if pf != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             || !pixel_buffer.is_planar()
@@ -205,6 +191,7 @@ impl VideoElement {
         {
             return false;
         }
+
         let y_w = pixel_buffer.get_width_of_plane(0);
         let y_h = pixel_buffer.get_height_of_plane(0);
         let uv_w = pixel_buffer.get_width_of_plane(1);
@@ -225,11 +212,11 @@ impl VideoElement {
         if pixel_buffer.lock_base_address(0) != kCVReturnSuccess {
             return false;
         }
+
         unsafe {
             let y_dst = pixel_buffer.get_base_address_of_plane(0) as *mut u8;
             let uv_dst = pixel_buffer.get_base_address_of_plane(1) as *mut u8;
 
-            // Copy Y plane row-wise respecting stride
             for row in 0..height {
                 let src_off = row * width;
                 let dst_off = row * y_stride;
@@ -239,7 +226,7 @@ impl VideoElement {
                     width,
                 );
             }
-            // Copy UV plane
+
             for row in 0..(height / 2) {
                 let src_off = y_size + row * width;
                 let dst_off = row * uv_stride;
@@ -250,6 +237,7 @@ impl VideoElement {
                 );
             }
         }
+
         let _ = pixel_buffer.unlock_base_address(0);
 
         let dest_bounds = self.fitted_bounds(bounds, frame_width, frame_height);
@@ -257,7 +245,6 @@ impl VideoElement {
         true
     }
 
-    /// Convert NV12 YUV data to RGB using optimized yuvutils-rs
     fn yuv_to_rgb(&self, yuv_data: &[u8], width: u32, height: u32) -> Vec<u8> {
         let width_usize = width as usize;
         let height_usize = height as usize;
@@ -265,71 +252,61 @@ impl VideoElement {
         let uv_size = (width_usize * height_usize) / 2;
 
         if yuv_data.len() < y_size + uv_size {
-            // Not enough data, return black frame
             return vec![0; width_usize * height_usize * 4];
         }
 
-        // Split NV12 data into Y and UV planes
         let y_plane = &yuv_data[..y_size];
         let uv_plane = &yuv_data[y_size..y_size + uv_size];
 
-        // Create YuvBiPlanarImage structure for NV12 data
         let yuv_bi_planar = YuvBiPlanarImage {
             y_plane,
             y_stride: width,
             uv_plane,
-            uv_stride: width, // NV12 UV stride is same as width
+            uv_stride: width,
             width,
             height,
         };
 
-        // Prepare output RGB buffer (BGRA format)
         let mut bgra = vec![0u8; width_usize * height_usize * 4];
         let rgba_stride = width * 4;
 
-        // Use yuvutils-rs optimized NV12 to RGB conversion
-        // Try Bt709 first (HD standard) with full range
+        // Try different color space conversions
         if yuv_nv12_to_bgra(
             &yuv_bi_planar,
             &mut bgra,
             rgba_stride,
-            YuvRange::Full,              // Try full range first
-            YuvStandardMatrix::Bt709,    // HD standard
-            YuvConversionMode::Balanced, // Use balanced conversion mode (default)
+            YuvRange::Full,
+            YuvStandardMatrix::Bt709,
+            YuvConversionMode::Balanced,
         )
         .is_ok()
         {
             return bgra;
         }
 
-        // Try Bt709 with limited range
         if yuv_nv12_to_bgra(
             &yuv_bi_planar,
             &mut bgra,
             rgba_stride,
-            YuvRange::Limited,           // Limited range
-            YuvStandardMatrix::Bt709,    // HD standard
-            YuvConversionMode::Balanced, // Use balanced conversion mode (default)
+            YuvRange::Limited,
+            YuvStandardMatrix::Bt709,
+            YuvConversionMode::Balanced,
         )
         .is_ok()
         {
             return bgra;
         }
 
-        // Fallback to Bt601 (SD standard)
         match yuv_nv12_to_bgra(
             &yuv_bi_planar,
             &mut bgra,
             rgba_stride,
             YuvRange::Limited,
             YuvStandardMatrix::Bt601,
-            YuvConversionMode::Balanced, // Use balanced conversion mode (default)
+            YuvConversionMode::Balanced,
         ) {
             Ok(_) => bgra,
-            Err(_) => {
-                // Final fallback to black frame on conversion error
-                vec![0; width_usize * height_usize * 4]
-            }
+            Err(_) => vec![0; width_usize * height_usize * 4],
         }
     }
 }
@@ -355,7 +332,6 @@ impl Element for VideoElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let (mut width, mut height) = self.get_display_size();
 
-        // Also honor any video-level display overrides if element-level not specified
         if self.display_width.is_none() || self.display_height.is_none() {
             let (vw, vh) = self.video.display_size();
             if self.display_width.is_none() {
@@ -391,10 +367,9 @@ impl Element for VideoElement {
         window: &mut Window,
         _cx: &mut gpui::App,
     ) -> Self::PrepaintState {
-        // Schedule repaints only when playing or when a new frame arrived.
+        // Always request animation frame when playing or when new frames arrive
         let is_playing = !self.video.eos() && !self.video.paused();
-        let has_new_frame = self.video.take_frame_ready();
-        if is_playing || has_new_frame {
+        if is_playing || self.video.buffered_len() > 0 {
             window.request_animation_frame();
         }
     }
@@ -409,16 +384,10 @@ impl Element for VideoElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        // FIX: Take only ONE frame, not all buffered frames
-        let frame_to_render: Option<(Vec<u8>, u32, u32)> = if self.video.buffered_len() > 0 {
-            // Pop only the NEXT frame to render
-            self.video.pop_buffered_frame()
-        } else {
-            // Fall back to current frame
-            self.video.current_frame_data()
-        };
+        // Just render the current frame - the decoder handles frame timing
+        let frame_data = self.video.current_frame_data();
 
-        if let Some((yuv_data, frame_width, frame_height)) = frame_to_render {
+        if let Some((yuv_data, frame_width, frame_height)) = frame_data {
             #[cfg(target_os = "macos")]
             {
                 if self.try_paint_surface_macos(
@@ -446,7 +415,6 @@ impl IntoElement for VideoElement {
     }
 }
 
-/// Helper function to create a video element
 pub fn video(video: Video) -> VideoElement {
     VideoElement::new(video)
 }

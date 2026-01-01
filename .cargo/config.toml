@@ -1,16 +1,20 @@
-[target.x86_64-pc-windows-gnu]
-linker = "clang"
-rustflags = [
-	"--cfg", "windows_sys",
-    "-C", "link-arg=-fuse-ld=lld",
-]
-
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
 rustflags = ["-C", "link-arg=/DEBUG:NONE"]
 
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+ar = "C:\\msys64\\mingw64\\bin\\ar.exe"
+
 [env]
-FFMPEG_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0"
-FFMPEG_LIBS_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0/lib"
-FFMPEG_INCLUDE_DIR = "C:/SNSPrograms/ffmpeg-n8.0.1-31-ge36046790a-win64-lgpl-shared-8.0/include"
-FFMPEG_SKIP_BUILD = "1"
+# Point to MinGW's clang for bindgen
+LIBCLANG_PATH = "C:\\msys64\\mingw64\\bin"
+BINDGEN_EXTRA_CLANG_ARGS = "-IC:\\msys64\\mingw64\\include -target x86_64-w64-mingw32"
+
+# FFmpeg paths
+FFMPEG_DIR = "C:\\msys64\\mingw64"
+PKG_CONFIG_PATH = "C:\\msys64\\mingw64\\lib\\pkgconfig"
+
+[target.'cfg(windows)']
+[build]
+target = "x86_64-pc-windows-gnu"
